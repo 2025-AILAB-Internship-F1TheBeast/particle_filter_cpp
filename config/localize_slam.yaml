@@ -2,7 +2,7 @@
 particle_filter:
   ros__parameters:
     # Particle filter parameters (optimized for real-time hardware performance)
-    max_particles: 500                # Total particles for localization (lower for real-time)
+    max_particles: 4000                # Total particles for localization (lower for real-time)
     max_viz_particles: 60              # Particles displayed in RViz (performance optimization)
     max_range: 5.0                     # Maximum laser range for processing (m)
     

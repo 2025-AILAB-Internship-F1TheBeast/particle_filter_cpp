@@ -662,15 +662,19 @@ void ParticleFilter::update()
 // --------------------------------- OUTPUT & VISUALIZATION ---------------------------------
 void ParticleFilter::publish_tf(const Eigen::Vector3d &pose, const rclcpp::Time &stamp)
 {
-    // Publish direct map → base_link transform for localization
+    // Calculate map → odom transform: T_map_odom = T_map_base * T_base_odom
+    // where T_base_odom = inverse(T_odom_base)
+    Eigen::Vector3d map_to_odom_pose = pose - last_pose_;  // Difference between particle filter estimate and odom
+    
+    // Publish map → odom transform for localization
     geometry_msgs::msg::TransformStamped t;
     t.header.stamp = stamp.nanoseconds() > 0 ? stamp : this->get_clock()->now();
     t.header.frame_id = "map";
-    t.child_frame_id = "base_link";
-    t.transform.translation.x = pose[0];
-    t.transform.translation.y = pose[1];
+    t.child_frame_id = "odom";
+    t.transform.translation.x = map_to_odom_pose[0];
+    t.transform.translation.y = map_to_odom_pose[1];
     t.transform.translation.z = 0.0;
-    t.transform.rotation = angle_to_quaternion(pose[2]);
+    t.transform.rotation = angle_to_quaternion(map_to_odom_pose[2]);
 
     pub_tf_->sendTransform(t);
 
