@@ -12,6 +12,7 @@
 #include <geometry_msgs/msg/pose_array.hpp>
 #include <geometry_msgs/msg/pose_stamped.hpp>
 #include <geometry_msgs/msg/pose_with_covariance_stamped.hpp>
+#include <nav_msgs/msg/occupancy_grid.hpp>
 #include <nav_msgs/msg/odometry.hpp>
 #include <nav_msgs/srv/get_map.hpp>
 #include <rclcpp/rclcpp.hpp>
@@ -23,6 +24,8 @@
 #include <mutex>
 #include <random>
 #include <vector>
+#include <unordered_set>
+#include <atomic>
 
 namespace particle_filter_cpp
 {
@@ -53,6 +56,14 @@ class ParticleFilter : public rclcpp::Node
 
     // --------------------------------- MAP MANAGEMENT ---------------------------------
     void get_omap();
+
+    // --------------------------------- DYNAMIC MAP MANAGEMENT ---------------------------------
+    void update_dynamic_obstacles(const Eigen::Vector3d& pose, 
+                                 const std::vector<float>& ranges,
+                                 const std::vector<float>& angles);
+    void update_cell(int x, int y, int8_t new_value);
+    void publish_dynamic_map_50hz();
+    bool is_dynamic_obstacle(const Eigen::Vector3d& pose, float angle, float observed_range, float expected_range);
 
     // --------------------------------- OUTPUT & VISUALIZATION ---------------------------------
     void publish_tf(const Eigen::Vector3d &pose, const rclcpp::Time &stamp);
@@ -140,6 +151,7 @@ class ParticleFilter : public rclcpp::Node
     rclcpp::Publisher<geometry_msgs::msg::PoseArray>::SharedPtr particle_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
     rclcpp::Publisher<nav_msgs::msg::Odometry>::SharedPtr odom_pub_;
+    rclcpp::Publisher<nav_msgs::msg::OccupancyGrid>::SharedPtr dynamic_map_pub_;
 
     // Services and TF
     rclcpp::Client<nav_msgs::srv::GetMap>::SharedPtr map_client_;
@@ -147,6 +159,7 @@ class ParticleFilter : public rclcpp::Node
     
     // Timer for high-frequency updates
     rclcpp::TimerBase::SharedPtr update_timer_;
+    rclcpp::TimerBase::SharedPtr dynamic_map_timer_;
 
     // --------------------------------- THREADING ---------------------------------
     std::mutex state_lock_;
@@ -174,6 +187,16 @@ class ParticleFilter : public rclcpp::Node
 
     // --------------------------------- ALGORITHM INTERNALS ---------------------------------
     std::vector<int> particle_indices_;
+
+    // --------------------------------- DYNAMIC MAP STATE ---------------------------------
+    std::vector<int8_t> dynamic_layer_;
+    std::unordered_set<int> dirty_cells_;
+    std::atomic<bool> has_changes_;
+    nav_msgs::msg::OccupancyGrid::SharedPtr cached_dynamic_map_;
+    double DYNAMIC_THRESHOLD_;
+    double CLEAR_THRESHOLD_;
+    int map_width_;
+    int map_height_;
 
     // --------------------------------- UPDATE CONTROL ---------------------------------
     void update();

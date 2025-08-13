@@ -96,6 +96,13 @@ ParticleFilter::ParticleFilter(const rclcpp::NodeOptions &options)
     expected_steps_between_odom_ = static_cast<int>(0.02 * TIMER_FREQUENCY);  // Default: 50Hz odom = 20ms interval
     accumulated_timer_motion_ = Eigen::Vector3d::Zero();
 
+    // Dynamic map initialization
+    DYNAMIC_THRESHOLD_ = 0.5;  // 0.5m threshold for dynamic obstacle detection
+    CLEAR_THRESHOLD_ = 0.3;    // 0.3m threshold for obstacle clearing
+    has_changes_.store(false);
+    map_width_ = 0;
+    map_height_ = 0;
+
     // Initialize particles with uniform weights
     particles_ = Eigen::MatrixXd::Zero(MAX_PARTICLES, 3);
     weights_.resize(MAX_PARTICLES, 1.0 / MAX_PARTICLES);
@@ -116,6 +123,9 @@ ParticleFilter::ParticleFilter(const rclcpp::NodeOptions &options)
     {
         odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/pf/pose/odom", 1);
     }
+
+    // Dynamic map publisher
+    dynamic_map_pub_ = this->create_publisher<nav_msgs::msg::OccupancyGrid>("/dynamic_map", 1);
 
     // Initialize TF broadcaster
     pub_tf_ = std::make_unique<tf2_ros::TransformBroadcaster>(*this);
@@ -147,6 +157,12 @@ ParticleFilter::ParticleFilter(const rclcpp::NodeOptions &options)
     update_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(timer_interval_ms),
         std::bind(&ParticleFilter::timer_update, this)
+    );
+
+    // Setup 50Hz dynamic map publishing timer
+    dynamic_map_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(20),  // 50Hz = 20ms
+        std::bind(&ParticleFilter::publish_dynamic_map_50hz, this)
     );
 
     RCLCPP_INFO(this->get_logger(), "Particle filter initialized with %.1fHz odometry publishing", TIMER_FREQUENCY);
@@ -196,8 +212,16 @@ void ParticleFilter::get_omap()
             }
         }
 
+        // Initialize dynamic map layer
+        map_width_ = width;
+        map_height_ = height;
+        dynamic_layer_.resize(width * height, -1);  // Initialize as unknown
+        
+        // Create cached dynamic map message
+        cached_dynamic_map_ = std::make_shared<nav_msgs::msg::OccupancyGrid>(*map_msg_);
+
         map_initialized_ = true;
-        RCLCPP_INFO(this->get_logger(), "Done loading map");
+        RCLCPP_INFO(this->get_logger(), "Done loading map (size: %dx%d)", width, height);
 
         // Generate lookup table for fast sensor model evaluation
         precompute_sensor_model();
@@ -534,6 +558,17 @@ void ParticleFilter::sensor_model(const Eigen::MatrixXd &proposal_dist, const st
         }
         weights[i] = std::pow(weight, INV_SQUASH_FACTOR);
     }
+
+    // Update dynamic map using the best particle's pose
+    if (weights.size() > 0) {
+        // Find best particle
+        auto max_it = std::max_element(weights.begin(), weights.end());
+        int best_idx = std::distance(weights.begin(), max_it);
+        Eigen::Vector3d best_pose = proposal_dist.row(best_idx).transpose();
+        
+        // Update dynamic obstacles using best particle's perspective
+        update_dynamic_obstacles(best_pose, obs, downsampled_angles_);
+    }
 }
 
 // --------------------------------- RAY CASTING ---------------------------------
@@ -863,6 +898,149 @@ void ParticleFilter::publish_particles(const Eigen::MatrixXd &particles_to_pub)
     pa.header.stamp = this->get_clock()->now();
     pa.header.frame_id = "/map";
     particle_pub_->publish(pa);
+}
+
+// --------------------------------- DYNAMIC MAP MANAGEMENT ---------------------------------
+void ParticleFilter::update_cell(int x, int y, int8_t new_value)
+{
+    if (x < 0 || x >= map_width_ || y < 0 || y >= map_height_) return;
+    
+    int idx = y * map_width_ + x;
+    
+    if (dynamic_layer_[idx] != new_value) {
+        dynamic_layer_[idx] = new_value;
+        dirty_cells_.insert(idx);
+        has_changes_.store(true);
+    }
+}
+
+bool ParticleFilter::is_dynamic_obstacle(const Eigen::Vector3d& pose, float angle, 
+                                       float observed_range, float expected_range)
+{
+    // Dynamic obstacle detected if observed range is significantly shorter than expected
+    if (observed_range < expected_range - DYNAMIC_THRESHOLD_) {
+        return true;
+    }
+    return false;
+}
+
+void ParticleFilter::update_dynamic_obstacles(const Eigen::Vector3d& pose, 
+                                            const std::vector<float>& ranges,
+                                            const std::vector<float>& angles)
+{
+    if (!map_initialized_) return;
+    
+    for (size_t i = 0; i < ranges.size(); ++i) {
+        float observed_range = ranges[i];
+        float angle = angles[i];
+        
+        // Skip invalid measurements
+        if (observed_range <= 0.1 || observed_range >= MAX_RANGE_METERS) continue;
+        
+        // Calculate expected range using ray casting
+        float expected_range = cast_ray(pose.x(), pose.y(), pose.z() + angle);
+        
+        // Check for dynamic obstacles
+        if (is_dynamic_obstacle(pose, angle, observed_range, expected_range)) {
+            // Mark obstacle at observed position in world coordinates
+            double obs_x = pose.x() + observed_range * cos(pose.z() + angle);
+            double obs_y = pose.y() + observed_range * sin(pose.z() + angle);
+            
+            // Convert world coordinates to map coordinates using proper transformation
+            Eigen::Vector3d world_pos(obs_x, obs_y, 0);
+            Eigen::Vector3d map_pos = utils::world_to_map(world_pos, map_msg_->info);
+            
+            int grid_x = static_cast<int>(std::round(map_pos.x()));
+            int grid_y = static_cast<int>(std::round(map_pos.y()));
+            
+            // Mark as occupied with confidence decay based on distance from expected
+            int8_t occupancy = static_cast<int8_t>(std::min(100.0, 
+                50.0 + 50.0 * (expected_range - observed_range) / DYNAMIC_THRESHOLD_));
+            
+            update_cell(grid_x, grid_y, occupancy);
+        }
+        
+        // Check for obstacle clearing
+        else if (observed_range > expected_range + CLEAR_THRESHOLD_) {
+            // Clear space between expected and observed positions
+            double start_x = pose.x() + expected_range * cos(pose.z() + angle);
+            double start_y = pose.y() + expected_range * sin(pose.z() + angle);
+            double end_x = pose.x() + observed_range * cos(pose.z() + angle);
+            double end_y = pose.y() + observed_range * sin(pose.z() + angle);
+            
+            // Simple line drawing to clear cells
+            int steps = static_cast<int>((observed_range - expected_range) / map_resolution_) + 1;
+            for (int step = 0; step < steps; ++step) {
+                double t = static_cast<double>(step) / steps;
+                double clear_x = start_x + t * (end_x - start_x);
+                double clear_y = start_y + t * (end_y - start_y);
+                
+                // Convert to map coordinates properly
+                Eigen::Vector3d world_pos(clear_x, clear_y, 0);
+                Eigen::Vector3d map_pos = utils::world_to_map(world_pos, map_msg_->info);
+                
+                int grid_x = static_cast<int>(std::round(map_pos.x()));
+                int grid_y = static_cast<int>(std::round(map_pos.y()));
+                
+                // Only clear if it was previously marked as dynamic obstacle
+                if (grid_x >= 0 && grid_x < map_width_ && grid_y >= 0 && grid_y < map_height_) {
+                    int idx = grid_y * map_width_ + grid_x;
+                    if (idx >= 0 && idx < static_cast<int>(dynamic_layer_.size()) && 
+                        dynamic_layer_[idx] > 0) {
+                        update_cell(grid_x, grid_y, 0);  // Mark as free
+                    }
+                }
+            }
+        }
+    }
+}
+
+void ParticleFilter::publish_dynamic_map_50hz()
+{
+    // For debugging: publish even without changes initially
+    static int publish_count = 0;
+    bool force_publish = (publish_count < 10);  // Force first 10 publishes
+    
+    if (!map_initialized_) {
+        if (publish_count == 0) {
+            RCLCPP_WARN(this->get_logger(), "Dynamic map not publishing: map not initialized");
+        }
+        return;
+    }
+    
+    if (!has_changes_.load() && !force_publish) return;
+    
+    // Update only changed cells
+    for (int idx : dirty_cells_) {
+        // Combine static map with dynamic changes
+        int8_t static_value = map_msg_->data[idx];
+        int8_t dynamic_value = dynamic_layer_[idx];
+        
+        // Priority: dynamic occupied > static occupied > dynamic free > static free
+        if (dynamic_value > 0) {
+            cached_dynamic_map_->data[idx] = dynamic_value;  // Dynamic obstacle
+        } else if (static_value > 0) {
+            cached_dynamic_map_->data[idx] = static_value;   // Static obstacle
+        } else if (dynamic_value == 0) {
+            cached_dynamic_map_->data[idx] = 0;              // Dynamically cleared
+        } else {
+            cached_dynamic_map_->data[idx] = static_value;   // Default to static
+        }
+    }
+    
+    cached_dynamic_map_->header.stamp = this->now();
+    cached_dynamic_map_->header.frame_id = "map";  // Ensure correct frame
+    dynamic_map_pub_->publish(*cached_dynamic_map_);
+    
+    publish_count++;
+    if (publish_count <= 10) {
+        RCLCPP_INFO(this->get_logger(), "Published dynamic map #%d (changes: %zu)", 
+                    publish_count, dirty_cells_.size());
+    }
+    
+    // Clear dirty flags
+    dirty_cells_.clear();
+    has_changes_.store(false);
 }
 
 // --------------------------------- UTILITY FUNCTIONS ---------------------------------
