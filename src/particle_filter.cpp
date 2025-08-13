@@ -96,9 +96,9 @@ ParticleFilter::ParticleFilter(const rclcpp::NodeOptions &options)
     expected_steps_between_odom_ = static_cast<int>(0.02 * TIMER_FREQUENCY);  // Default: 50Hz odom = 20ms interval
     accumulated_timer_motion_ = Eigen::Vector3d::Zero();
 
-    // Dynamic map initialization
-    DYNAMIC_THRESHOLD_ = 0.5;  // 0.5m threshold for dynamic obstacle detection
-    CLEAR_THRESHOLD_ = 0.3;    // 0.3m threshold for obstacle clearing
+    // Dynamic map initialization - More aggressive detection
+    DYNAMIC_THRESHOLD_ = 0.8;  // 0.8m threshold for dynamic obstacle detection (more sensitive)
+    CLEAR_THRESHOLD_ = 0.6;    // 0.6m threshold for obstacle clearing
     has_changes_.store(false);
     map_width_ = 0;
     map_height_ = 0;
@@ -159,9 +159,9 @@ ParticleFilter::ParticleFilter(const rclcpp::NodeOptions &options)
         std::bind(&ParticleFilter::timer_update, this)
     );
 
-    // Setup 50Hz dynamic map publishing timer
+    // Setup 100Hz dynamic map publishing timer (faster updates)
     dynamic_map_timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(20),  // 50Hz = 20ms
+        std::chrono::milliseconds(10),  // 100Hz = 10ms for faster response
         std::bind(&ParticleFilter::publish_dynamic_map_50hz, this)
     );
 
@@ -559,15 +559,22 @@ void ParticleFilter::sensor_model(const Eigen::MatrixXd &proposal_dist, const st
         weights[i] = std::pow(weight, INV_SQUASH_FACTOR);
     }
 
-    // Update dynamic map using the best particle's pose
+    // Update dynamic map using multiple top particles for better coverage
     if (weights.size() > 0) {
-        // Find best particle
-        auto max_it = std::max_element(weights.begin(), weights.end());
-        int best_idx = std::distance(weights.begin(), max_it);
-        Eigen::Vector3d best_pose = proposal_dist.row(best_idx).transpose();
+        // Use top 3 particles instead of just the best one
+        std::vector<std::pair<double, int>> weight_idx_pairs;
+        for (size_t i = 0; i < weights.size(); ++i) {
+            weight_idx_pairs.push_back({weights[i], static_cast<int>(i)});
+        }
+        std::sort(weight_idx_pairs.rbegin(), weight_idx_pairs.rend());
         
-        // Update dynamic obstacles using best particle's perspective
-        update_dynamic_obstacles(best_pose, obs, downsampled_angles_);
+        // Update using top 3 particles for more comprehensive detection
+        int num_particles_to_use = std::min(3, static_cast<int>(weights.size()));
+        for (int p = 0; p < num_particles_to_use; ++p) {
+            int particle_idx = weight_idx_pairs[p].second;
+            Eigen::Vector3d particle_pose = proposal_dist.row(particle_idx).transpose();
+            update_dynamic_obstacles(particle_pose, obs, downsampled_angles_);
+        }
     }
 }
 
@@ -934,17 +941,21 @@ void ParticleFilter::update_dynamic_obstacles(const Eigen::Vector3d& pose,
         float observed_range = ranges[i];
         float angle = angles[i];
         
-        // Skip invalid measurements
-        if (observed_range <= 0.1 || observed_range >= MAX_RANGE_METERS) continue;
+        // Skip invalid measurements (but allow closer ranges for better detection)
+        if (observed_range <= 0.05 || observed_range >= MAX_RANGE_METERS) continue;
         
         // Calculate expected range using ray casting
         float expected_range = cast_ray(pose.x(), pose.y(), pose.z() + angle);
         
         // Check for dynamic obstacles
         if (is_dynamic_obstacle(pose, angle, observed_range, expected_range)) {
-            // Mark obstacle at observed position in world coordinates
-            double obs_x = pose.x() + observed_range * cos(pose.z() + angle);
-            double obs_y = pose.y() + observed_range * sin(pose.z() + angle);
+            // Calculate lidar position with offset
+            double lidar_x = pose.x() + LIDAR_OFFSET_X * cos(pose.z()) - LIDAR_OFFSET_Y * sin(pose.z());
+            double lidar_y = pose.y() + LIDAR_OFFSET_X * sin(pose.z()) + LIDAR_OFFSET_Y * cos(pose.z());
+            
+            // Mark obstacle at observed position from lidar position
+            double obs_x = lidar_x + observed_range * cos(pose.z() + angle);
+            double obs_y = lidar_y + observed_range * sin(pose.z() + angle);
             
             // Convert world coordinates to map coordinates using proper transformation
             Eigen::Vector3d world_pos(obs_x, obs_y, 0);
@@ -962,11 +973,15 @@ void ParticleFilter::update_dynamic_obstacles(const Eigen::Vector3d& pose,
         
         // Check for obstacle clearing
         else if (observed_range > expected_range + CLEAR_THRESHOLD_) {
-            // Clear space between expected and observed positions
-            double start_x = pose.x() + expected_range * cos(pose.z() + angle);
-            double start_y = pose.y() + expected_range * sin(pose.z() + angle);
-            double end_x = pose.x() + observed_range * cos(pose.z() + angle);
-            double end_y = pose.y() + observed_range * sin(pose.z() + angle);
+            // Calculate lidar position with offset
+            double lidar_x = pose.x() + LIDAR_OFFSET_X * cos(pose.z()) - LIDAR_OFFSET_Y * sin(pose.z());
+            double lidar_y = pose.y() + LIDAR_OFFSET_X * sin(pose.z()) + LIDAR_OFFSET_Y * cos(pose.z());
+            
+            // Clear space between expected and observed positions from lidar position
+            double start_x = lidar_x + expected_range * cos(pose.z() + angle);
+            double start_y = lidar_y + expected_range * sin(pose.z() + angle);
+            double end_x = lidar_x + observed_range * cos(pose.z() + angle);
+            double end_y = lidar_y + observed_range * sin(pose.z() + angle);
             
             // Simple line drawing to clear cells
             int steps = static_cast<int>((observed_range - expected_range) / map_resolution_) + 1;
