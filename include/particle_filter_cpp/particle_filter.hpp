@@ -63,6 +63,8 @@ class ParticleFilter : public rclcpp::Node
                                  const std::vector<float>& angles);
     void update_cell(int x, int y, int8_t new_value);
     void publish_dynamic_map_50hz();
+    void publish_dynamic_map_regular();  // 2Hz regular publishing
+    void publish_dynamic_map_immediate(); // Immediate publishing on changes
     bool is_dynamic_obstacle(const Eigen::Vector3d& pose, float angle, float observed_range, float expected_range);
 
     // --------------------------------- OUTPUT & VISUALIZATION ---------------------------------
@@ -160,6 +162,7 @@ class ParticleFilter : public rclcpp::Node
     // Timer for high-frequency updates
     rclcpp::TimerBase::SharedPtr update_timer_;
     rclcpp::TimerBase::SharedPtr dynamic_map_timer_;
+    rclcpp::TimerBase::SharedPtr dynamic_map_regular_timer_;  // 2Hz regular publishing
 
     // --------------------------------- THREADING ---------------------------------
     std::mutex state_lock_;

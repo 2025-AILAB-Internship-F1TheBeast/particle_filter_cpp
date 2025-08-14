@@ -159,11 +159,13 @@ ParticleFilter::ParticleFilter(const rclcpp::NodeOptions &options)
         std::bind(&ParticleFilter::timer_update, this)
     );
 
-    // Setup 100Hz dynamic map publishing timer (faster updates)
-    dynamic_map_timer_ = this->create_wall_timer(
-        std::chrono::milliseconds(10),  // 100Hz = 10ms for faster response
-        std::bind(&ParticleFilter::publish_dynamic_map_50hz, this)
+    // Setup 2Hz regular dynamic map publishing timer
+    dynamic_map_regular_timer_ = this->create_wall_timer(
+        std::chrono::milliseconds(500),  // 2Hz = 500ms for regular updates
+        std::bind(&ParticleFilter::publish_dynamic_map_regular, this)
     );
+
+    // Remove the old 100Hz timer - we'll use immediate publishing instead
 
     RCLCPP_INFO(this->get_logger(), "Particle filter initialized with %.1fHz odometry publishing", TIMER_FREQUENCY);
 }
@@ -918,6 +920,9 @@ void ParticleFilter::update_cell(int x, int y, int8_t new_value)
         dynamic_layer_[idx] = new_value;
         dirty_cells_.insert(idx);
         has_changes_.store(true);
+        
+        // Immediately publish when changes occur
+        publish_dynamic_map_immediate();
     }
 }
 
@@ -1052,6 +1057,58 @@ void ParticleFilter::publish_dynamic_map_50hz()
         RCLCPP_INFO(this->get_logger(), "Published dynamic map #%d (changes: %zu)", 
                     publish_count, dirty_cells_.size());
     }
+    
+    // Clear dirty flags
+    dirty_cells_.clear();
+    has_changes_.store(false);
+}
+
+void ParticleFilter::publish_dynamic_map_regular()
+{
+    // Regular 2Hz publishing - always publish to maintain connection
+    if (!map_initialized_) {
+        RCLCPP_WARN_THROTTLE(this->get_logger(), *this->get_clock(), 5000, 
+                             "Dynamic map regular publishing: map not initialized");
+        return;
+    }
+    
+    // Update timestamp and publish current state
+    cached_dynamic_map_->header.stamp = this->now();
+    cached_dynamic_map_->header.frame_id = "map";
+    dynamic_map_pub_->publish(*cached_dynamic_map_);
+    
+    RCLCPP_DEBUG(this->get_logger(), "Published dynamic map (regular 2Hz)");
+}
+
+void ParticleFilter::publish_dynamic_map_immediate()
+{
+    // Immediate publishing when changes occur
+    if (!map_initialized_) return;
+    
+    // Update only changed cells
+    for (int idx : dirty_cells_) {
+        // Combine static map with dynamic changes
+        int8_t static_value = map_msg_->data[idx];
+        int8_t dynamic_value = dynamic_layer_[idx];
+        
+        // Priority: dynamic occupied > static occupied > dynamic free > static free
+        if (dynamic_value > 0) {
+            cached_dynamic_map_->data[idx] = dynamic_value;  // Dynamic obstacle
+        } else if (static_value > 0) {
+            cached_dynamic_map_->data[idx] = static_value;   // Static obstacle
+        } else if (dynamic_value == 0) {
+            cached_dynamic_map_->data[idx] = 0;              // Dynamically cleared
+        } else {
+            cached_dynamic_map_->data[idx] = static_value;   // Default to static
+        }
+    }
+    
+    // Update timestamp and publish
+    cached_dynamic_map_->header.stamp = this->now();
+    cached_dynamic_map_->header.frame_id = "map";
+    dynamic_map_pub_->publish(*cached_dynamic_map_);
+    
+    RCLCPP_DEBUG(this->get_logger(), "Published dynamic map (immediate, changes: %zu)", dirty_cells_.size());
     
     // Clear dirty flags
     dirty_cells_.clear();
