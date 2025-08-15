@@ -2,11 +2,14 @@
 
 High-performance Monte Carlo Localization (MCL) for robot navigation. 
 
+Part of the F1TENTH autonomous racing system - provides localization for path planning and control.
+
 ## Quick Start
 
 ```bash
-# Build
+# Build (from workspace root)
 colcon build --packages-select particle_filter_cpp --symlink-install
+source install/setup.bash
 
 # For F1TENTH Gym Simulation
 ros2 launch particle_filter_cpp localize_sim_launch.py
