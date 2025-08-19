@@ -475,16 +475,20 @@ void ParticleFilter::sensor_model(const Eigen::MatrixXd &proposal_dist, const st
         first_sensor_update_ = false;
     }
 
-    // Generate ray queries
+    // Generate ray queries - convert base_link poses to lidar poses for ray casting
     auto query_start = std::chrono::high_resolution_clock::now();
     for (int i = 0; i < MAX_PARTICLES; ++i)
     {
+        // Convert base_link pose to lidar pose
+        Eigen::Vector3d base_link_pose = proposal_dist.row(i).transpose();
+        Eigen::Vector3d lidar_pose = base_link_to_laser_pose(base_link_pose);
+        
         for (int j = 0; j < num_rays; ++j)
         {
             int idx = i * num_rays + j;
-            queries_(idx, 0) = proposal_dist(i, 0);
-            queries_(idx, 1) = proposal_dist(i, 1);
-            queries_(idx, 2) = proposal_dist(i, 2) + downsampled_angles_[j];
+            queries_(idx, 0) = lidar_pose[0];
+            queries_(idx, 1) = lidar_pose[1];
+            queries_(idx, 2) = lidar_pose[2] + downsampled_angles_[j];
         }
     }
     auto query_end = std::chrono::high_resolution_clock::now();
@@ -715,11 +719,13 @@ void ParticleFilter::timer_update()
 // --------------------------------- OUTPUT & VISUALIZATION ---------------------------------
 void ParticleFilter::publish_tf(const Eigen::Vector3d &pose, const rclcpp::Time &stamp)
 {
-    // Publish map → laser transform
+    // Pose is already in base_link frame - no conversion needed
+    
+    // Publish map → base_link transform
     geometry_msgs::msg::TransformStamped t;
     t.header.stamp = stamp.nanoseconds() > 0 ? stamp : this->get_clock()->now();
     t.header.frame_id = "/map";
-    t.child_frame_id = "/laser";
+    t.child_frame_id = "/base_link";
     t.transform.translation.x = pose[0];
     t.transform.translation.y = pose[1];
     t.transform.translation.z = 0.0;
@@ -733,6 +739,7 @@ void ParticleFilter::publish_tf(const Eigen::Vector3d &pose, const rclcpp::Time 
         nav_msgs::msg::Odometry odom;
         odom.header.stamp = this->get_clock()->now();
         odom.header.frame_id = "/map";
+        odom.child_frame_id = "/base_link";
         odom.pose.pose.position.x = pose[0];
         odom.pose.pose.position.y = pose[1];
         odom.pose.pose.orientation = angle_to_quaternion(pose[2]);
@@ -749,14 +756,15 @@ void ParticleFilter::publish_odom_100hz()
     nav_msgs::msg::Odometry odom;
     odom.header.stamp = this->get_clock()->now();
     odom.header.frame_id = "map";
-    odom.child_frame_id = "laser";
+    odom.child_frame_id = "base_link";
     
-    // Get best available pose
-    Eigen::Vector3d pose_to_publish = get_current_pose();
-    odom.pose.pose.position.x = pose_to_publish[0];
-    odom.pose.pose.position.y = pose_to_publish[1];
+    // Get best available pose - already in base_link frame
+    Eigen::Vector3d base_link_pose = get_current_pose();
+    
+    odom.pose.pose.position.x = base_link_pose[0];
+    odom.pose.pose.position.y = base_link_pose[1];
     odom.pose.pose.position.z = 0.0;
-    odom.pose.pose.orientation = angle_to_quaternion(pose_to_publish[2]);
+    odom.pose.pose.orientation = angle_to_quaternion(base_link_pose[2]);
     
     // Set velocity
     odom.twist.twist.linear.x = current_speed_;
@@ -848,6 +856,42 @@ geometry_msgs::msg::Quaternion ParticleFilter::angle_to_quaternion(double angle)
 Eigen::Matrix2d ParticleFilter::rotation_matrix(double angle)
 {
     return utils::rotation_matrix(angle);
+}
+
+Eigen::Vector3d ParticleFilter::laser_to_base_link_pose(const Eigen::Vector3d &laser_pose)
+{
+    // Transform laser pose to base_link pose using lidar offset
+    // The lidar offset represents the translation from base_link to laser in base_link frame
+    
+    Eigen::Vector3d base_link_pose = laser_pose;
+    
+    // Apply inverse transformation: base_link = laser - R(theta) * offset
+    double cos_theta = std::cos(laser_pose[2]);
+    double sin_theta = std::sin(laser_pose[2]);
+    
+    base_link_pose[0] = laser_pose[0] - (cos_theta * LIDAR_OFFSET_X - sin_theta * LIDAR_OFFSET_Y);
+    base_link_pose[1] = laser_pose[1] - (sin_theta * LIDAR_OFFSET_X + cos_theta * LIDAR_OFFSET_Y);
+    base_link_pose[2] = laser_pose[2]; // Orientation remains the same
+    
+    return base_link_pose;
+}
+
+Eigen::Vector3d ParticleFilter::base_link_to_laser_pose(const Eigen::Vector3d &base_link_pose)
+{
+    // Transform base_link pose to laser pose using lidar offset
+    // The lidar offset represents the translation from base_link to laser in base_link frame
+    
+    Eigen::Vector3d laser_pose = base_link_pose;
+    
+    // Apply forward transformation: laser = base_link + R(theta) * offset
+    double cos_theta = std::cos(base_link_pose[2]);
+    double sin_theta = std::sin(base_link_pose[2]);
+    
+    laser_pose[0] = base_link_pose[0] + (cos_theta * LIDAR_OFFSET_X - sin_theta * LIDAR_OFFSET_Y);
+    laser_pose[1] = base_link_pose[1] + (sin_theta * LIDAR_OFFSET_X + cos_theta * LIDAR_OFFSET_Y);
+    laser_pose[2] = base_link_pose[2]; // Orientation remains the same
+    
+    return laser_pose;
 }
 
 // --------------------------------- PERFORMANCE PROFILING ---------------------------------

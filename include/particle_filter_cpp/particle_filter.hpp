@@ -68,6 +68,8 @@ class ParticleFilter : public rclcpp::Node
     double quaternion_to_angle(const geometry_msgs::msg::Quaternion &q);
     geometry_msgs::msg::Quaternion angle_to_quaternion(double angle);
     Eigen::Matrix2d rotation_matrix(double angle);
+    Eigen::Vector3d laser_to_base_link_pose(const Eigen::Vector3d &laser_pose);
+    Eigen::Vector3d base_link_to_laser_pose(const Eigen::Vector3d &base_link_pose);
 
     // --------------------------------- RAY CASTING ---------------------------------
     std::vector<float> calc_range_many(const Eigen::MatrixXd &queries);
