@@ -23,70 +23,11 @@ namespace particle_filter_cpp
 ParticleFilter::ParticleFilter(const rclcpp::NodeOptions &options)
     : Node("particle_filter", options), rng_(std::random_device{}()), uniform_dist_(0.0, 1.0), normal_dist_(0.0, 1.0)
 {
-    // ROS2 parameter declarations
-    this->declare_parameter("angle_step", 18);
-    this->declare_parameter("max_particles", 4000);
-    this->declare_parameter("max_viz_particles", 60);
-    this->declare_parameter("squash_factor", 2.2);
-    this->declare_parameter("max_range", 12.0);
-    this->declare_parameter("theta_discretization", 112);
-    this->declare_parameter("range_method", "rmgpu");
-    this->declare_parameter("rangelib_variant", 1);
-    this->declare_parameter("fine_timing", 0);
-    this->declare_parameter("publish_odom", true);
-    this->declare_parameter("viz", true);
-    this->declare_parameter("z_short", 0.01);
-    this->declare_parameter("z_max", 0.07);
-    this->declare_parameter("z_rand", 0.12);
-    this->declare_parameter("z_hit", 0.80);
-    this->declare_parameter("sigma_hit", 8.0);
-    this->declare_parameter("motion_dispersion_x", 0.05);
-    this->declare_parameter("motion_dispersion_y", 0.025);
-    this->declare_parameter("motion_dispersion_theta", 0.25);
-    this->declare_parameter("lidar_offset_x", 0.0);
-    this->declare_parameter("lidar_offset_y", 0.0);
-    this->declare_parameter("wheelbase", 0.325);
-    this->declare_parameter("scan_topic", "/scan");
-    this->declare_parameter("odom_topic", "/odom");
-    this->declare_parameter("timer_frequency", 100.0);
-    this->declare_parameter("use_parallel_raycasting", true);
-    this->declare_parameter("num_threads", 0); // 0 = auto-detect
-
-    // Retrieve parameter values
-    ANGLE_STEP = this->get_parameter("angle_step").as_int();
-    MAX_PARTICLES = this->get_parameter("max_particles").as_int();
-    MAX_VIZ_PARTICLES = this->get_parameter("max_viz_particles").as_int();
-    INV_SQUASH_FACTOR = 1.0 / this->get_parameter("squash_factor").as_double();
-    MAX_RANGE_METERS = this->get_parameter("max_range").as_double();
-    THETA_DISCRETIZATION = this->get_parameter("theta_discretization").as_int();
-    WHICH_RM = this->get_parameter("range_method").as_string();
-    RANGELIB_VAR = this->get_parameter("rangelib_variant").as_int();
-    SHOW_FINE_TIMING = this->get_parameter("fine_timing").as_int() > 0;
-    PUBLISH_ODOM = this->get_parameter("publish_odom").as_bool();
-    DO_VIZ = this->get_parameter("viz").as_bool();
-    TIMER_FREQUENCY = this->get_parameter("timer_frequency").as_double();
-    USE_PARALLEL_RAYCASTING = this->get_parameter("use_parallel_raycasting").as_bool();
-    NUM_THREADS = this->get_parameter("num_threads").as_int();
-
-    // 4-component sensor model parameters
-    Z_SHORT = this->get_parameter("z_short").as_double();
-    Z_MAX = this->get_parameter("z_max").as_double();
-    Z_RAND = this->get_parameter("z_rand").as_double();
-    Z_HIT = this->get_parameter("z_hit").as_double();
-    SIGMA_HIT = this->get_parameter("sigma_hit").as_double();
-
-    // Motion model noise parameters
-    MOTION_DISPERSION_X = this->get_parameter("motion_dispersion_x").as_double();
-    MOTION_DISPERSION_Y = this->get_parameter("motion_dispersion_y").as_double();
-    MOTION_DISPERSION_THETA = this->get_parameter("motion_dispersion_theta").as_double();
-
-    // Robot geometry parameters
-    LIDAR_OFFSET_X = this->get_parameter("lidar_offset_x").as_double();
-    LIDAR_OFFSET_Y = this->get_parameter("lidar_offset_y").as_double();
-    WHEELBASE = this->get_parameter("wheelbase").as_double();
+    declare_parameters();
+    load_parameters();
 
     // System state initialization
-    MAX_RANGE_PX = 0;
+    max_range_px_ = 0;
     odometry_data_ = Eigen::Vector3d::Zero();
     iters_ = 0;
     map_initialized_ = false;
@@ -98,30 +39,30 @@ ParticleFilter::ParticleFilter(const rclcpp::NodeOptions &options)
     
     // --------------------------------- THREADING SETUP ---------------------------------
     // Setup OpenMP for parallel ray casting
-    if (USE_PARALLEL_RAYCASTING) {
-        if (NUM_THREADS == 0) {
-            NUM_THREADS = omp_get_max_threads();
+    if (use_parallel_raycasting_) {
+        if (num_threads_ == 0) {
+            num_threads_ = omp_get_max_threads();
         }
-        omp_set_num_threads(NUM_THREADS);
+        omp_set_num_threads(num_threads_);
     }
 
     // Initialize particles with uniform weights
-    particles_ = Eigen::MatrixXd::Zero(MAX_PARTICLES, 3);
-    weights_.resize(MAX_PARTICLES, 1.0 / MAX_PARTICLES);
-    particle_indices_.resize(MAX_PARTICLES);
+    particles_ = Eigen::MatrixXd::Zero(max_particles_, 3);
+    weights_.resize(max_particles_, 1.0 / max_particles_);
+    particle_indices_.resize(max_particles_);
     std::iota(particle_indices_.begin(), particle_indices_.end(), 0);
 
     // Motion model cache
-    local_deltas_ = Eigen::MatrixXd::Zero(MAX_PARTICLES, 3);
+    local_deltas_ = Eigen::MatrixXd::Zero(max_particles_, 3);
 
     // ROS2 publishers for visualization and navigation
-    if (DO_VIZ)
+    if (do_viz_)
     {
         pose_pub_ = this->create_publisher<geometry_msgs::msg::PoseStamped>("/pf/viz/inferred_pose", 1);
         particle_pub_ = this->create_publisher<geometry_msgs::msg::PoseArray>("/pf/viz/particles", 1);
     }
 
-    if (PUBLISH_ODOM)
+    if (publish_odom_)
     {
         odom_pub_ = this->create_publisher<nav_msgs::msg::Odometry>("/pf/pose/odom", 1);
     }
@@ -152,16 +93,96 @@ ParticleFilter::ParticleFilter(const rclcpp::NodeOptions &options)
     initialize_global();
 
     // Setup configurable frequency update timer for motion interpolation
-    int timer_interval_ms = static_cast<int>(1000.0 / TIMER_FREQUENCY);
+    int timer_interval_ms = static_cast<int>(1000.0 / timer_frequency_);
     update_timer_ = this->create_wall_timer(
         std::chrono::milliseconds(timer_interval_ms),
         std::bind(&ParticleFilter::timer_update, this)
     );
 
-    RCLCPP_INFO(this->get_logger(), "Particle filter initialized with %.1fHz odometry publishing", TIMER_FREQUENCY);
+    RCLCPP_INFO(this->get_logger(), "Particle filter initialized with %.1fHz odometry publishing", timer_frequency_);
     RCLCPP_INFO(this->get_logger(), "Ray casting method: TRADITIONAL");
     RCLCPP_INFO(this->get_logger(), "Parallel ray casting: %s (%d threads)", 
-        USE_PARALLEL_RAYCASTING ? "ENABLED" : "DISABLED", USE_PARALLEL_RAYCASTING ? NUM_THREADS : 1);
+        use_parallel_raycasting_ ? "ENABLED" : "DISABLED", use_parallel_raycasting_ ? num_threads_ : 1);
+}
+
+void ParticleFilter::declare_parameters()
+{
+    // Algorithm parameters
+    this->declare_parameter("angle_step", 18);
+    this->declare_parameter("max_particles", 4000);
+    this->declare_parameter("max_viz_particles", 60);
+    this->declare_parameter("squash_factor", 2.2);
+    this->declare_parameter("max_range", 12.0);
+    this->declare_parameter("theta_discretization", 112);
+    this->declare_parameter("range_method", "rmgpu");
+    this->declare_parameter("rangelib_variant", 1);
+    
+    // System parameters
+    this->declare_parameter("fine_timing", 0);
+    this->declare_parameter("publish_odom", true);
+    this->declare_parameter("viz", true);
+    this->declare_parameter("timer_frequency", 100.0);
+    this->declare_parameter("use_parallel_raycasting", true);
+    this->declare_parameter("num_threads", 0);
+    
+    // Sensor model parameters
+    this->declare_parameter("z_short", 0.01);
+    this->declare_parameter("z_max", 0.07);
+    this->declare_parameter("z_rand", 0.12);
+    this->declare_parameter("z_hit", 0.80);
+    this->declare_parameter("sigma_hit", 8.0);
+    
+    // Motion model parameters
+    this->declare_parameter("motion_dispersion_x", 0.05);
+    this->declare_parameter("motion_dispersion_y", 0.025);
+    this->declare_parameter("motion_dispersion_theta", 0.25);
+    
+    // Robot geometry parameters
+    this->declare_parameter("lidar_offset_x", 0.0);
+    this->declare_parameter("lidar_offset_y", 0.0);
+    this->declare_parameter("wheelbase", 0.325);
+    
+    // Topic parameters
+    this->declare_parameter("scan_topic", "/scan");
+    this->declare_parameter("odom_topic", "/odom");
+}
+
+void ParticleFilter::load_parameters()
+{
+    // Algorithm parameters
+    angle_step_ = this->get_parameter("angle_step").as_int();
+    max_particles_ = this->get_parameter("max_particles").as_int();
+    max_viz_particles_ = this->get_parameter("max_viz_particles").as_int();
+    inv_squash_factor_ = 1.0 / this->get_parameter("squash_factor").as_double();
+    max_range_meters_ = this->get_parameter("max_range").as_double();
+    theta_discretization_ = this->get_parameter("theta_discretization").as_int();
+    range_method_ = this->get_parameter("range_method").as_string();
+    rangelib_variant_ = this->get_parameter("rangelib_variant").as_int();
+    
+    // System parameters
+    show_fine_timing_ = this->get_parameter("fine_timing").as_int() > 0;
+    publish_odom_ = this->get_parameter("publish_odom").as_bool();
+    do_viz_ = this->get_parameter("viz").as_bool();
+    timer_frequency_ = this->get_parameter("timer_frequency").as_double();
+    use_parallel_raycasting_ = this->get_parameter("use_parallel_raycasting").as_bool();
+    num_threads_ = this->get_parameter("num_threads").as_int();
+    
+    // Sensor model parameters
+    z_short_ = this->get_parameter("z_short").as_double();
+    z_max_ = this->get_parameter("z_max").as_double();
+    z_rand_ = this->get_parameter("z_rand").as_double();
+    z_hit_ = this->get_parameter("z_hit").as_double();
+    sigma_hit_ = this->get_parameter("sigma_hit").as_double();
+    
+    // Motion model parameters
+    motion_dispersion_x_ = this->get_parameter("motion_dispersion_x").as_double();
+    motion_dispersion_y_ = this->get_parameter("motion_dispersion_y").as_double();
+    motion_dispersion_theta_ = this->get_parameter("motion_dispersion_theta").as_double();
+    
+    // Robot geometry parameters
+    lidar_offset_x_ = this->get_parameter("lidar_offset_x").as_double();
+    lidar_offset_y_ = this->get_parameter("lidar_offset_y").as_double();
+    wheelbase_ = this->get_parameter("wheelbase").as_double();
 }
 
 // --------------------------------- MAP LOADING & PREPROCESSING ---------------------------------
@@ -187,9 +208,9 @@ void ParticleFilter::get_omap()
         map_origin_ = Eigen::Vector3d(map_msg_->info.origin.position.x, map_msg_->info.origin.position.y,
                                       quaternion_to_angle(map_msg_->info.origin.orientation));
 
-        MAX_RANGE_PX = static_cast<int>(MAX_RANGE_METERS / map_resolution_);
+        max_range_px_ = static_cast<int>(max_range_meters_ / map_resolution_);
 
-        RCLCPP_INFO(this->get_logger(), "Initializing range method: %s", WHICH_RM.c_str());
+        RCLCPP_INFO(this->get_logger(), "Initializing range method: %s", range_method_.c_str());
 
         // Extract free space (occupancy = 0) for particle initialization
         int height = map_msg_->info.height;
@@ -231,7 +252,7 @@ void ParticleFilter::precompute_sensor_model()
         return;
     }
 
-    int table_width = MAX_RANGE_PX + 1;
+    int table_width = max_range_px_ + 1;
     sensor_model_table_ = Eigen::MatrixXd::Zero(table_width, table_width);
 
     auto start_time = std::chrono::high_resolution_clock::now();
@@ -246,25 +267,25 @@ void ParticleFilter::precompute_sensor_model()
             double prob = 0.0;
             double z = static_cast<double>(r - d);
 
-            // Z_HIT: Gaussian around expected range
-            prob += Z_HIT * std::exp(-(z * z) / (2.0 * SIGMA_HIT * SIGMA_HIT)) / (SIGMA_HIT * std::sqrt(2.0 * M_PI));
+            // z_hit_: Gaussian around expected range
+            prob += z_hit_ * std::exp(-(z * z) / (2.0 * sigma_hit_ * sigma_hit_)) / (sigma_hit_ * std::sqrt(2.0 * M_PI));
 
-            // Z_SHORT: Exponential for early obstacles
+            // z_short_: Exponential for early obstacles
             if (r < d)
             {
-                prob += 2.0 * Z_SHORT * (d - r) / static_cast<double>(d);
+                prob += 2.0 * z_short_ * (d - r) / static_cast<double>(d);
             }
 
-            // Z_MAX: Delta function at maximum range
-            if (r == MAX_RANGE_PX)
+            // z_max_: Delta function at maximum range
+            if (r == max_range_px_)
             {
-                prob += Z_MAX;
+                prob += z_max_;
             }
 
-            // Z_RAND: Uniform distribution
-            if (r < MAX_RANGE_PX)
+            // z_rand_: Uniform distribution
+            if (r < max_range_px_)
             {
-                prob += Z_RAND * 1.0 / static_cast<double>(MAX_RANGE_PX);
+                prob += z_rand_ * 1.0 / static_cast<double>(max_range_px_);
             }
 
             norm += prob;
@@ -298,7 +319,7 @@ void ParticleFilter::lidarCB(const sensor_msgs::msg::LaserScan::SharedPtr msg)
         }
 
         // Create downsampled angles
-        for (size_t i = 0; i < laser_angles_.size(); i += ANGLE_STEP)
+        for (size_t i = 0; i < laser_angles_.size(); i += angle_step_)
         {
             downsampled_angles_.push_back(laser_angles_[i]);
         }
@@ -306,9 +327,9 @@ void ParticleFilter::lidarCB(const sensor_msgs::msg::LaserScan::SharedPtr msg)
         RCLCPP_INFO(this->get_logger(), "Downsampled to %zu angles", downsampled_angles_.size());
     }
 
-    // Extract every ANGLE_STEP-th measurement
+    // Extract every angle_step_-th measurement
     downsampled_ranges_.clear();
-    for (size_t i = 0; i < msg->ranges.size(); i += ANGLE_STEP)
+    for (size_t i = 0; i < msg->ranges.size(); i += angle_step_)
     {
         downsampled_ranges_.push_back(msg->ranges[i]);
     }
@@ -372,10 +393,10 @@ void ParticleFilter::initialize_particles_pose(const Eigen::Vector3d &pose)
 
     std::lock_guard<std::mutex> lock(state_lock_);
 
-    std::fill(weights_.begin(), weights_.end(), 1.0 / MAX_PARTICLES);
+    std::fill(weights_.begin(), weights_.end(), 1.0 / max_particles_);
 
     // Gaussian distribution around clicked pose
-    for (int i = 0; i < MAX_PARTICLES; ++i)
+    for (int i = 0; i < max_particles_; ++i)
     {
         particles_(i, 0) = pose[0] + normal_dist_(rng_) * 0.5;  // σ_x = 0.5m
         particles_(i, 1) = pose[1] + normal_dist_(rng_) * 0.5;  // σ_y = 0.5m
@@ -415,7 +436,7 @@ void ParticleFilter::initialize_global()
     std::uniform_int_distribution<int> pos_dist(0, permissible_positions.size() - 1);
     std::uniform_real_distribution<double> angle_dist(0.0, 2.0 * M_PI);
 
-    for (int i = 0; i < MAX_PARTICLES; ++i)
+    for (int i = 0; i < max_particles_; ++i)
     {
         int idx = pos_dist(rng_);
         auto pos = permissible_positions[idx];
@@ -426,9 +447,9 @@ void ParticleFilter::initialize_global()
         particles_(i, 2) = angle_dist(rng_);
     }
 
-    std::fill(weights_.begin(), weights_.end(), 1.0 / MAX_PARTICLES);
+    std::fill(weights_.begin(), weights_.end(), 1.0 / max_particles_);
 
-    RCLCPP_INFO(this->get_logger(), "Initialized %d particles from %zu permissible positions", MAX_PARTICLES,
+    RCLCPP_INFO(this->get_logger(), "Initialized %d particles from %zu permissible positions", max_particles_,
                 permissible_positions.size());
 }
 
@@ -436,7 +457,7 @@ void ParticleFilter::initialize_global()
 void ParticleFilter::motion_model(Eigen::MatrixXd &proposal_dist, const Eigen::Vector3d &action)
 {
     // Apply motion transformation: local → global coordinates
-    for (int i = 0; i < MAX_PARTICLES; ++i)
+    for (int i = 0; i < max_particles_; ++i)
     {
         double cos_theta = std::cos(proposal_dist(i, 2));
         double sin_theta = std::sin(proposal_dist(i, 2));
@@ -449,11 +470,11 @@ void ParticleFilter::motion_model(Eigen::MatrixXd &proposal_dist, const Eigen::V
     proposal_dist += local_deltas_;
 
     // Add Gaussian process noise
-    for (int i = 0; i < MAX_PARTICLES; ++i)
+    for (int i = 0; i < max_particles_; ++i)
     {
-        proposal_dist(i, 0) += normal_dist_(rng_) * MOTION_DISPERSION_X;
-        proposal_dist(i, 1) += normal_dist_(rng_) * MOTION_DISPERSION_Y;
-        proposal_dist(i, 2) += normal_dist_(rng_) * MOTION_DISPERSION_THETA;
+        proposal_dist(i, 0) += normal_dist_(rng_) * motion_dispersion_x_;
+        proposal_dist(i, 1) += normal_dist_(rng_) * motion_dispersion_y_;
+        proposal_dist(i, 2) += normal_dist_(rng_) * motion_dispersion_theta_;
     }
 }
 
@@ -465,10 +486,10 @@ void ParticleFilter::sensor_model(const Eigen::MatrixXd &proposal_dist, const st
     // First-time array allocation for ray casting
     if (first_sensor_update_)
     {
-        queries_ = Eigen::MatrixXd::Zero(num_rays * MAX_PARTICLES, 3);
-        ranges_.resize(num_rays * MAX_PARTICLES);
+        queries_ = Eigen::MatrixXd::Zero(num_rays * max_particles_, 3);
+        ranges_.resize(num_rays * max_particles_);
         tiled_angles_.clear();
-        for (int i = 0; i < MAX_PARTICLES; ++i)
+        for (int i = 0; i < max_particles_; ++i)
         {
             tiled_angles_.insert(tiled_angles_.end(), downsampled_angles_.begin(), downsampled_angles_.end());
         }
@@ -477,7 +498,7 @@ void ParticleFilter::sensor_model(const Eigen::MatrixXd &proposal_dist, const st
 
     // Generate ray queries - convert base_link poses to lidar poses for ray casting
     auto query_start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < MAX_PARTICLES; ++i)
+    for (int i = 0; i < max_particles_; ++i)
     {
         // Convert base_link pose to lidar pose
         Eigen::Vector3d base_link_pose = proposal_dist.row(i).transpose();
@@ -500,43 +521,42 @@ void ParticleFilter::sensor_model(const Eigen::MatrixXd &proposal_dist, const st
     // Start timing for sensor model evaluation (lookup table part only)
     auto sensor_eval_start = std::chrono::high_resolution_clock::now();
 
-    // Convert to pixel units and compute weights
-    std::vector<float> obs_px(obs.size());
-    std::vector<float> ranges_px(ranges_.size());
+    // Convert ranges to pixel units and compute particle weights
+    auto obs_px = convert_to_pixels(obs);
+    auto ranges_px = convert_to_pixels(ranges_);
+    compute_particle_weights(obs_px, ranges_px, weights, num_rays);
 
-    for (size_t i = 0; i < obs.size(); ++i)
+    auto sensor_eval_end = std::chrono::high_resolution_clock::now();
+    timing_stats_.sensor_model_time += std::chrono::duration<double, std::milli>(sensor_eval_end - sensor_eval_start).count();
+}
+
+std::vector<float> ParticleFilter::convert_to_pixels(const std::vector<float> &ranges)
+{
+    std::vector<float> pixels(ranges.size());
+    for (size_t i = 0; i < ranges.size(); ++i)
     {
-        obs_px[i] = obs[i] / map_resolution_;
-        if (obs_px[i] > MAX_RANGE_PX)
-            obs_px[i] = MAX_RANGE_PX;
+        float pixel_value = ranges[i] / map_resolution_;
+        pixels[i] = std::min(pixel_value, static_cast<float>(max_range_px_));
     }
+    return pixels;
+}
 
-    for (size_t i = 0; i < ranges_.size(); ++i)
-    {
-        ranges_px[i] = ranges_[i] / map_resolution_;
-        if (ranges_px[i] > MAX_RANGE_PX)
-            ranges_px[i] = MAX_RANGE_PX;
-    }
-
-    // Likelihood calculation using lookup table
-    for (int i = 0; i < MAX_PARTICLES; ++i)
+void ParticleFilter::compute_particle_weights(const std::vector<float> &obs_px, 
+                                            const std::vector<float> &ranges_px,
+                                            std::vector<double> &weights, 
+                                            int num_rays)
+{
+    for (int i = 0; i < max_particles_; ++i)
     {
         double weight = 1.0;
         for (int j = 0; j < num_rays; ++j)
         {
-            int obs_idx = static_cast<int>(std::round(obs_px[j]));
-            int range_idx = static_cast<int>(std::round(ranges_px[i * num_rays + j]));
-
-            obs_idx = std::max(0, std::min(obs_idx, MAX_RANGE_PX));
-            range_idx = std::max(0, std::min(range_idx, MAX_RANGE_PX));
-
+            int obs_idx = std::clamp(static_cast<int>(std::round(obs_px[j])), 0, max_range_px_);
+            int range_idx = std::clamp(static_cast<int>(std::round(ranges_px[i * num_rays + j])), 0, max_range_px_);
             weight *= sensor_model_table_(obs_idx, range_idx);
         }
-        weights[i] = std::pow(weight, INV_SQUASH_FACTOR);
+        weights[i] = std::pow(weight, inv_squash_factor_);
     }
-
-    auto sensor_eval_end = std::chrono::high_resolution_clock::now();
-    timing_stats_.sensor_model_time += std::chrono::duration<double, std::milli>(sensor_eval_end - sensor_eval_start).count();
 }
 
 // --------------------------------- RAY CASTING ---------------------------------
@@ -547,7 +567,7 @@ std::vector<float> ParticleFilter::calc_range_many(const Eigen::MatrixXd &querie
     std::vector<float> results(queries.rows());
 
     // --------------------------------- PARALLEL PROCESSING ---------------------------------
-    if (USE_PARALLEL_RAYCASTING) {
+    if (use_parallel_raycasting_) {
         // Parallel ray casting with OpenMP
         #pragma omp parallel for schedule(dynamic)
         for (int i = 0; i < queries.rows(); ++i)
@@ -571,7 +591,7 @@ std::vector<float> ParticleFilter::calc_range_many(const Eigen::MatrixXd &querie
 float ParticleFilter::cast_ray(double x, double y, double angle)
 {
     if (!map_initialized_)
-        return MAX_RANGE_METERS;
+        return max_range_meters_;
 
     double dx = std::cos(angle) * map_resolution_;
     double dy = std::sin(angle) * map_resolution_;
@@ -579,7 +599,7 @@ float ParticleFilter::cast_ray(double x, double y, double angle)
     double current_x = x;
     double current_y = y;
 
-    for (int step = 0; step < MAX_RANGE_PX; ++step)
+    for (int step = 0; step < max_range_px_; ++step)
     {
         current_x += dx;
         current_y += dy;
@@ -606,7 +626,7 @@ float ParticleFilter::cast_ray(double x, double y, double angle)
         }
     }
 
-    return MAX_RANGE_METERS;
+    return max_range_meters_;
 }
 
 void ParticleFilter::MCL(const Eigen::Vector3d &action, const std::vector<float> &observation)
@@ -616,9 +636,9 @@ void ParticleFilter::MCL(const Eigen::Vector3d &action, const std::vector<float>
     // Step 1: Multinomial resampling
     auto resample_start = std::chrono::high_resolution_clock::now();
     std::discrete_distribution<int> particle_dist(weights_.begin(), weights_.end());
-    Eigen::MatrixXd proposal_distribution(MAX_PARTICLES, 3);
+    Eigen::MatrixXd proposal_distribution(max_particles_, 3);
 
-    for (int i = 0; i < MAX_PARTICLES; ++i)
+    for (int i = 0; i < max_particles_; ++i)
     {
         int idx = particle_dist(rng_);
         proposal_distribution.row(i) = particles_.row(idx);
@@ -636,14 +656,7 @@ void ParticleFilter::MCL(const Eigen::Vector3d &action, const std::vector<float>
     sensor_model(proposal_distribution, observation, weights_);
 
     // Step 4: Weight normalization
-    double sum_weights = std::accumulate(weights_.begin(), weights_.end(), 0.0);
-    if (sum_weights > 0)
-    {
-        for (double &w : weights_)
-        {
-            w /= sum_weights;
-        }
-    }
+    normalize_weights();
 
     // Step 5: Update particle set
     particles_ = proposal_distribution;
@@ -656,11 +669,21 @@ void ParticleFilter::MCL(const Eigen::Vector3d &action, const std::vector<float>
 Eigen::Vector3d ParticleFilter::expected_pose()
 {
     Eigen::Vector3d pose = Eigen::Vector3d::Zero();
-    for (int i = 0; i < MAX_PARTICLES; ++i)
+    for (int i = 0; i < max_particles_; ++i)
     {
         pose += weights_[i] * particles_.row(i).transpose();
     }
     return pose;
+}
+
+void ParticleFilter::normalize_weights()
+{
+    double sum_weights = std::accumulate(weights_.begin(), weights_.end(), 0.0);
+    if (sum_weights > 0)
+    {
+        std::transform(weights_.begin(), weights_.end(), weights_.begin(),
+                      [sum_weights](double w) { return w / sum_weights; });
+    }
 }
 
 // --------------------------------- MAIN UPDATE LOOP ---------------------------------
@@ -734,7 +757,7 @@ void ParticleFilter::publish_tf(const Eigen::Vector3d &pose, const rclcpp::Time 
     pub_tf_->sendTransform(t);
 
     // Optional odometry output
-    if (PUBLISH_ODOM && odom_pub_)
+    if (publish_odom_ && odom_pub_)
     {
         nav_msgs::msg::Odometry odom;
         odom.header.stamp = this->get_clock()->now();
@@ -750,7 +773,7 @@ void ParticleFilter::publish_tf(const Eigen::Vector3d &pose, const rclcpp::Time 
 
 void ParticleFilter::publish_odom_100hz()
 {
-    if (!PUBLISH_ODOM || !odom_pub_)
+    if (!publish_odom_ || !odom_pub_)
         return;
     
     nav_msgs::msg::Odometry odom;
@@ -795,7 +818,7 @@ bool ParticleFilter::is_pose_valid(const Eigen::Vector3d& pose)
 
 void ParticleFilter::visualize()
 {
-    if (!DO_VIZ)
+    if (!do_viz_)
         return;
 
     // RViz pose visualization
@@ -813,13 +836,13 @@ void ParticleFilter::visualize()
     // RViz particle cloud (downsampled for performance)
     if (particle_pub_ && particle_pub_->get_subscription_count() > 0)
     {
-        if (MAX_PARTICLES > MAX_VIZ_PARTICLES)
+        if (max_particles_ > max_viz_particles_)
         {
             // Weighted downsampling
             std::discrete_distribution<int> particle_dist(weights_.begin(), weights_.end());
-            Eigen::MatrixXd viz_particles(MAX_VIZ_PARTICLES, 3);
+            Eigen::MatrixXd viz_particles(max_viz_particles_, 3);
 
-            for (int i = 0; i < MAX_VIZ_PARTICLES; ++i)
+            for (int i = 0; i < max_viz_particles_; ++i)
             {
                 int idx = particle_dist(rng_);
                 viz_particles.row(i) = particles_.row(idx);
@@ -869,8 +892,8 @@ Eigen::Vector3d ParticleFilter::laser_to_base_link_pose(const Eigen::Vector3d &l
     double cos_theta = std::cos(laser_pose[2]);
     double sin_theta = std::sin(laser_pose[2]);
     
-    base_link_pose[0] = laser_pose[0] - (cos_theta * LIDAR_OFFSET_X - sin_theta * LIDAR_OFFSET_Y);
-    base_link_pose[1] = laser_pose[1] - (sin_theta * LIDAR_OFFSET_X + cos_theta * LIDAR_OFFSET_Y);
+    base_link_pose[0] = laser_pose[0] - (cos_theta * lidar_offset_x_ - sin_theta * lidar_offset_y_);
+    base_link_pose[1] = laser_pose[1] - (sin_theta * lidar_offset_x_ + cos_theta * lidar_offset_y_);
     base_link_pose[2] = laser_pose[2]; // Orientation remains the same
     
     return base_link_pose;
@@ -887,8 +910,8 @@ Eigen::Vector3d ParticleFilter::base_link_to_laser_pose(const Eigen::Vector3d &b
     double cos_theta = std::cos(base_link_pose[2]);
     double sin_theta = std::sin(base_link_pose[2]);
     
-    laser_pose[0] = base_link_pose[0] + (cos_theta * LIDAR_OFFSET_X - sin_theta * LIDAR_OFFSET_Y);
-    laser_pose[1] = base_link_pose[1] + (sin_theta * LIDAR_OFFSET_X + cos_theta * LIDAR_OFFSET_Y);
+    laser_pose[0] = base_link_pose[0] + (cos_theta * lidar_offset_x_ - sin_theta * lidar_offset_y_);
+    laser_pose[1] = base_link_pose[1] + (sin_theta * lidar_offset_x_ + cos_theta * lidar_offset_y_);
     laser_pose[2] = base_link_pose[2]; // Orientation remains the same
     
     return laser_pose;
@@ -923,7 +946,7 @@ void ParticleFilter::print_performance_stats()
         "Resampling:       %.2f ms/iter (%.1f%%)", avg_resample, 100.0*avg_resample/avg_total);
     RCLCPP_INFO(this->get_logger(), 
         "Particles: %d, Rays/particle: %zu, Total rays: %d", 
-        MAX_PARTICLES, downsampled_angles_.size(), MAX_PARTICLES * static_cast<int>(downsampled_angles_.size()));
+        max_particles_, downsampled_angles_.size(), max_particles_ * static_cast<int>(downsampled_angles_.size()));
     RCLCPP_INFO(this->get_logger(), "=====================================");
     
     reset_performance_stats();

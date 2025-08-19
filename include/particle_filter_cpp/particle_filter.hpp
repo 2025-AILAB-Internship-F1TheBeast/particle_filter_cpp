@@ -39,8 +39,16 @@ class ParticleFilter : public rclcpp::Node
     void sensor_model(const Eigen::MatrixXd &proposal_dist, const std::vector<float> &obs,
                       std::vector<double> &weights);
     Eigen::Vector3d expected_pose();
+    
+    // --------------------------------- SENSOR MODEL HELPERS ---------------------------------
+    std::vector<float> convert_to_pixels(const std::vector<float> &ranges);
+    void compute_particle_weights(const std::vector<float> &obs_px, const std::vector<float> &ranges_px,
+                                std::vector<double> &weights, int num_rays);
+    void normalize_weights();
 
     // --------------------------------- INITIALIZATION ---------------------------------
+    void declare_parameters();
+    void load_parameters();
     void initialize_global();
     void initialize_particles_pose(const Eigen::Vector3d &pose);
     void precompute_sensor_model();
@@ -75,31 +83,32 @@ class ParticleFilter : public rclcpp::Node
     std::vector<float> calc_range_many(const Eigen::MatrixXd &queries);
     float cast_ray(double x, double y, double angle);
 
-    // --------------------------------- ALGORITHM PARAMETERS ---------------------------------
-    int ANGLE_STEP;
-    int MAX_PARTICLES;
-    int MAX_VIZ_PARTICLES;
-    double INV_SQUASH_FACTOR;
-    double MAX_RANGE_METERS;
-    int THETA_DISCRETIZATION;
-    std::string WHICH_RM;
-    int RANGELIB_VAR;
-    bool SHOW_FINE_TIMING;
-    bool PUBLISH_ODOM;
-    bool DO_VIZ;
-    double TIMER_FREQUENCY;
-    bool USE_PARALLEL_RAYCASTING;
-    int NUM_THREADS;
+    // --------------------------------- CONFIGURATION PARAMETERS ---------------------------------
+    // Algorithm parameters
+    int angle_step_;
+    int max_particles_;
+    int max_viz_particles_;
+    double inv_squash_factor_;
+    double max_range_meters_;
+    int theta_discretization_;
+    std::string range_method_;
+    int rangelib_variant_;
+    bool show_fine_timing_;
+    bool publish_odom_;
+    bool do_viz_;
+    double timer_frequency_;
+    bool use_parallel_raycasting_;
+    int num_threads_;
 
-    // --------------------------------- SENSOR MODEL PARAMETERS ---------------------------------
-    double Z_SHORT, Z_MAX, Z_RAND, Z_HIT, SIGMA_HIT;
+    // Sensor model parameters (4-component beam model)
+    double z_short_, z_max_, z_rand_, z_hit_, sigma_hit_;
 
-    // --------------------------------- MOTION MODEL PARAMETERS ---------------------------------
-    double MOTION_DISPERSION_X, MOTION_DISPERSION_Y, MOTION_DISPERSION_THETA;
+    // Motion model noise parameters
+    double motion_dispersion_x_, motion_dispersion_y_, motion_dispersion_theta_;
 
-    // --------------------------------- SENSOR FRAME PARAMETERS ---------------------------------
-    double LIDAR_OFFSET_X, LIDAR_OFFSET_Y;
-    double WHEELBASE;
+    // Robot geometry parameters
+    double lidar_offset_x_, lidar_offset_y_;
+    double wheelbase_;
 
     // --------------------------------- PARTICLE FILTER STATE ---------------------------------
     Eigen::MatrixXd particles_;
@@ -123,7 +132,7 @@ class ParticleFilter : public rclcpp::Node
 
     // --------------------------------- SENSOR MODEL OPTIMIZATION ---------------------------------
     Eigen::MatrixXd sensor_model_table_;
-    int MAX_RANGE_PX;
+    int max_range_px_;
     double map_resolution_;
     Eigen::Vector3d map_origin_;
 
